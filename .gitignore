@@ -1,0 +1,7 @@
+dist/
+*.tar.gz
+*.zip
+node_modules/
+gpui-kit.d.ts
+*.error
+.DS_Store

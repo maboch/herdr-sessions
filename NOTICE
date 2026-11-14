@@ -1,0 +1,9 @@
+Herdr Session Save & Restore
+Copyright 2026 the herdr-sessions authors
+
+This package contains a modified copy of the `workspace-chrome` mod shipped
+with Herdr (https://herdr.dev), Copyright the Herdr authors, licensed under
+the Apache License, Version 2.0 (see LICENSE).
+
+The SVG icons in mods/sessions-chrome are from Lucide (https://lucide.dev),
+ISC License, as shipped with Herdr's mods.

@@ -1,0 +1,9 @@
+{
+  "sessions": {
+    "auto_restore": false,
+    "continue": {
+      "opencode": ["--continue"],
+      "codex": ["resume", "--last"]
+    }
+  }
+}

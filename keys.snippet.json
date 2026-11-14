@@ -1,0 +1,6 @@
+{
+  "global": {
+    "ctrl-shift-s": "sessions-chrome.save",
+    "ctrl-shift-r": "sessions-chrome.restore"
+  }
+}
