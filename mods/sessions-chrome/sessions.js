@@ -215,7 +215,62 @@ function alreadyContinues(argv, args) {
   return args.some((a) => rest.includes(a));
 }
 
-function restoreArgv(saved, settings) {
+// A person starts agents from their interactive shell, where PATH and env come
+// from .zshrc/.bashrc. herdr-core on a remote machine has the bare SSH PATH,
+// so a saved `opencode` may exist for the person but not for core. Run remote
+// programs through the same kind of shell (the one the snapshot shows) so they
+// get that environment; the shell stays under the program when it exits.
+const POSIX_SHELL = /(^|\/)(sh|bash|zsh|dash|ksh)$/i;
+
+function shellFromSnapshot(snapshot, machine) {
+  for (const space of snapshot.spaces) {
+    if ((space.machine ?? null) !== machine) continue;
+    for (const tab of space.tabs) {
+      for (const pane of tab.panes) {
+        if (pane.program === "shell" && pane.command && POSIX_SHELL.test(pane.command)) return pane.command;
+        if (POSIX_SHELL.test(pane.argv?.[0] ?? "")) return pane.argv[0];
+      }
+    }
+  }
+  return null;
+}
+
+function shellFromTerminals(machine) {
+  for (const terminal of terminals()) {
+    const address = terminal.address ?? "";
+    const slash = address.indexOf("/");
+    const name = slash === -1 ? null : address.slice(0, slash);
+    if ((name ?? null) !== machine) continue;
+    const program = terminal.foreground?.name ?? terminal.program?.name;
+    if (program && POSIX_SHELL.test(program)) return program;
+  }
+  return null;
+}
+
+async function shellForMachine(snapshot, machine, cache) {
+  const key = machine ?? null;
+  if (cache.has(key)) return cache.get(key);
+  let shell = shellFromSnapshot(snapshot, key) ?? shellFromTerminals(key);
+  if (!shell && key) {
+    // The snapshot may only hold agent panes; ask the machine for its shell.
+    try {
+      const r = await exec("sh", ["-c", 'printf %s "$SHELL"'], { on: key });
+      const name = r.stdout.trim();
+      if (r.code === 0 && POSIX_SHELL.test(name)) shell = name;
+    } catch {}
+  }
+  cache.set(key, shell);
+  return shell;
+}
+
+function wrapForShell(argv, shell) {
+  if (!argv?.length || !shell || !POSIX_SHELL.test(shell)) return argv;
+  // Already a shell wrapper (for example saved from an agent started by Herdr).
+  if (argv.some((arg) => typeof arg === "string" && arg.includes('"$@"'))) return argv;
+  return [shell, "-lic", '"$@"; exec "$0" -i', shell, ...argv];
+}
+
+function baseRestoreArgv(saved, settings) {
   let argv = Array.isArray(saved.argv) && saved.argv.length ? [...saved.argv] : null;
   if (!saved.agent) return argv;
   const key = saved.program || saved.app || (argv?.[0] ?? null);
@@ -228,6 +283,20 @@ function restoreArgv(saved, settings) {
   }
   if (alreadyContinues(argv, args)) return argv;
   return [argv[0], ...args, ...argv.slice(1)];
+}
+
+// `space.new` and `tab.new` already run argv through the machine's login shell;
+// `terminal.open` and `pane.split` do not, so those calls ask for the wrapper.
+function restoreArgv(saved, settings, ctx, wrap = false) {
+  const argv = baseRestoreArgv(saved, settings);
+  return wrap && ctx?.machine ? wrapForShell(argv, ctx.shell) : argv;
+}
+
+function noteError(ctx, savedTab, error) {
+  const where = [ctx?.spaceName, savedTab?.name].filter(Boolean).join(" / ");
+  const reason = String(error?.message ?? error).replace(/\s+/g, " ").trim();
+  const text = where ? `${where}: ${reason}` : reason;
+  if (text) ctx.errors.push(text);
 }
 
 function describePane(pane, terminal, space) {
@@ -435,7 +504,7 @@ function paneKey(tabId, index) {
 }
 
 async function addPane(basePane, saved, settings, ctx, savedTab, index) {
-  const argv = restoreArgv(saved, settings);
+  const argv = restoreArgv(saved, settings, ctx, true);
   const args = stripEmpty({
     argv,
     folder: saved.cwd || undefined,
@@ -461,7 +530,7 @@ async function createTab(spaceId, savedTab, settings, ctx) {
     space: spaceId,
     name: savedTab.named ? savedTab.name : undefined,
     folder: first?.cwd || undefined,
-    argv: first ? restoreArgv(first, settings) : undefined,
+    argv: first ? restoreArgv(first, settings, ctx) : undefined,
   }));
   ctx.tabs++;
   const tabId = out.tab;
@@ -473,17 +542,21 @@ async function createTab(spaceId, savedTab, settings, ctx) {
   }
   let base = ctx.paneIds.get(paneKey(savedTab.id, 0)) ?? null;
   for (let i = 1; i < savedTab.panes.length; i++) {
-    if (!base) {
-      const out2 = await appDo("terminal.open", stripEmpty({
-        argv: restoreArgv(savedTab.panes[i], settings),
-        folder: savedTab.panes[i].cwd || undefined,
-        place: "tab",
-      }));
-      ctx.panes++;
-      base = out2.pane ?? panes().find((p) => p.terminal === out2.terminal)?.pane ?? null;
-      ctx.paneIds.set(paneKey(savedTab.id, i), base);
-    } else {
-      base = await addPane(base, savedTab.panes[i], settings, ctx, savedTab, i);
+    try {
+      if (!base) {
+        const out2 = await appDo("terminal.open", stripEmpty({
+          argv: restoreArgv(savedTab.panes[i], settings, ctx, true),
+          folder: savedTab.panes[i].cwd || undefined,
+          place: "tab",
+        }));
+        ctx.panes++;
+        base = out2.pane ?? panes().find((p) => p.terminal === out2.terminal)?.pane ?? null;
+        ctx.paneIds.set(paneKey(savedTab.id, i), base);
+      } else {
+        base = await addPane(base, savedTab.panes[i], settings, ctx, savedTab, i);
+      }
+    } catch (error) {
+      noteError(ctx, savedTab, error);
     }
   }
   await applyTabExtras(tabId, savedTab, ctx);
@@ -516,18 +589,22 @@ async function restoreTabPanes(space, savedTab, settings, ctx, claimedTabs) {
       if (!base) base = found.pane;
       continue;
     }
-    if (!base) {
-      const out = await appDo("terminal.open", stripEmpty({
-        argv: restoreArgv(saved, settings),
-        folder: saved.cwd || undefined,
-        place: "tab",
-      }));
-      ctx.panes++;
-      base = out.pane ?? panes().find((p) => p.terminal === out.terminal)?.pane ?? null;
-      if (out.tab) ctx.tabIds.set(savedTab.id, out.tab);
-      ctx.paneIds.set(paneKey(savedTab.id, i), base);
-    } else {
-      base = await addPane(base, saved, settings, ctx, savedTab, i);
+    try {
+      if (!base) {
+        const out = await appDo("terminal.open", stripEmpty({
+          argv: restoreArgv(saved, settings, ctx, true),
+          folder: saved.cwd || undefined,
+          place: "tab",
+        }));
+        ctx.panes++;
+        base = out.pane ?? panes().find((p) => p.terminal === out.terminal)?.pane ?? null;
+        if (out.tab) ctx.tabIds.set(savedTab.id, out.tab);
+        ctx.paneIds.set(paneKey(savedTab.id, i), base);
+      } else {
+        base = await addPane(base, saved, settings, ctx, savedTab, i);
+      }
+    } catch (error) {
+      noteError(ctx, savedTab, error);
     }
   }
   await applyTabExtras(tab.id, savedTab, ctx);
@@ -562,6 +639,86 @@ async function waitForMachines(cx, snapshot) {
   }
 }
 
+async function restoreSpace(savedSpace, settings, ctx, claimed, auto) {
+  let changed = false;
+  if (savedSpace.machine) {
+    const machine = machines().find((m) => m.name === savedSpace.machine);
+    if (!machine || machine.layout !== "ready") {
+      if (!auto) ctx.errors.push(`${savedSpace.machine}: machine unavailable`);
+      return false;
+    }
+  }
+  let space = findSpace(savedSpace, claimed);
+  if (!space) {
+    const firstTab = savedSpace.tabs[0];
+    if (!firstTab || !firstTab.panes.length) return false;
+    const first = firstTab.panes[0];
+    const out = await appDo("space.new", stripEmpty({
+      name: savedSpace.named ? savedSpace.name : undefined,
+      folder: first.cwd || savedSpace.folder || undefined,
+      tab: firstTab.named ? firstTab.name : undefined,
+      argv: restoreArgv(first, settings, ctx),
+      machine: savedSpace.machine || undefined,
+    }));
+    ctx.spaces++;
+    changed = true;
+    ctx.spaceIds.set(savedSpace.id, out.space);
+    claimed.add(out.space);
+    ctx.tabIds.set(firstTab.id, out.tab);
+    ctx.panes++;
+    const firstPane = out.pane ?? panes().find((p) => p.terminal === out.terminal)?.pane ?? null;
+    ctx.paneIds.set(paneKey(firstTab.id, 0), firstPane);
+    let base = firstPane;
+    for (let i = 1; i < firstTab.panes.length; i++) {
+      const before = ctx.panes;
+      try {
+        base = await addPane(base, firstTab.panes[i], settings, ctx, firstTab, i);
+      } catch (error) {
+        noteError(ctx, firstTab, error);
+      }
+      if (ctx.panes > before) changed = true;
+    }
+    await applyTabExtras(out.tab, firstTab, ctx);
+    const current = spaces().find((s) => s.id === out.space);
+    const claimedTabs = new Set([out.tab]);
+    for (const savedTab of savedSpace.tabs.slice(1)) {
+      const beforePanes = ctx.panes;
+      try {
+        const opened = current
+          ? await restoreTabPanes(current, savedTab, settings, ctx, claimedTabs)
+          : await createTab(out.space, savedTab, settings, ctx);
+        if (opened) {
+          ctx.tabIds.set(savedTab.id, opened.tabId);
+          claimedTabs.add(opened.tabId);
+        }
+      } catch (error) {
+        noteError(ctx, savedTab, error);
+      }
+      if (ctx.panes > beforePanes) changed = true;
+    }
+    space = spaces().find((s) => s.id === out.space) ?? null;
+  } else {
+    claimed.add(space.id);
+    ctx.spaceIds.set(savedSpace.id, space.id);
+    const claimedTabs = new Set();
+    for (const savedTab of savedSpace.tabs) {
+      const beforeTabs = new Set((space.tabs ?? []).map((t) => t.id));
+      const beforePanes = ctx.panes;
+      try {
+        const opened = await restoreTabPanes(space, savedTab, settings, ctx, claimedTabs);
+        if (opened) {
+          ctx.tabIds.set(savedTab.id, opened.tabId);
+          if (!beforeTabs.has(opened.tabId)) changed = true;
+        }
+      } catch (error) {
+        noteError(ctx, savedTab, error);
+      }
+      if (ctx.panes > beforePanes) changed = true;
+    }
+  }
+  return changed;
+}
+
 export async function restoreSession({ cx, auto = false } = {}) {
   if (busy) return false;
   busy = "restore";
@@ -571,6 +728,7 @@ export async function restoreSession({ cx, auto = false } = {}) {
   const ctx = {
     spaces: 0, tabs: 0, panes: 0, skipped: 0, errors: [],
     spaceIds: new Map(), tabIds: new Map(), paneIds: new Map(),
+    shells: new Map(), machine: null, shell: null, spaceName: null,
   };
   try {
     const snapshot = await readSnapshot();
@@ -583,67 +741,13 @@ export async function restoreSession({ cx, auto = false } = {}) {
     if (auto) await waitForMachines(cx, snapshot);
     const claimed = claimedSpaces();
     for (const savedSpace of snapshot.spaces) {
-      if (savedSpace.machine) {
-        const machine = machines().find((m) => m.name === savedSpace.machine);
-        if (!machine || machine.layout !== "ready") {
-          if (!auto) ctx.errors.push(`${savedSpace.machine}: machine unavailable`);
-          continue;
-        }
-      }
-      let space = findSpace(savedSpace, claimed);
-      if (!space) {
-        const firstTab = savedSpace.tabs[0];
-        if (!firstTab || !firstTab.panes.length) continue;
-        const first = firstTab.panes[0];
-        const out = await appDo("space.new", stripEmpty({
-          name: savedSpace.named ? savedSpace.name : undefined,
-          folder: first.cwd || savedSpace.folder || undefined,
-          tab: firstTab.named ? firstTab.name : undefined,
-          argv: restoreArgv(first, settings),
-          machine: savedSpace.machine || undefined,
-        }));
-        ctx.spaces++;
-        changed = true;
-        ctx.spaceIds.set(savedSpace.id, out.space);
-        claimed.add(out.space);
-        ctx.tabIds.set(firstTab.id, out.tab);
-        ctx.panes++;
-        const firstPane = out.pane ?? panes().find((p) => p.terminal === out.terminal)?.pane ?? null;
-        ctx.paneIds.set(paneKey(firstTab.id, 0), firstPane);
-        let base = firstPane;
-        for (let i = 1; i < firstTab.panes.length; i++) {
-          base = await addPane(base, firstTab.panes[i], settings, ctx, firstTab, i);
-          changed = true;
-        }
-        await applyTabExtras(out.tab, firstTab, ctx);
-        const current = spaces().find((s) => s.id === out.space);
-        const claimedTabs = new Set([out.tab]);
-        for (const savedTab of savedSpace.tabs.slice(1)) {
-          const beforePanes = ctx.panes;
-          const opened = current
-            ? await restoreTabPanes(current, savedTab, settings, ctx, claimedTabs)
-            : await createTab(out.space, savedTab, settings, ctx);
-          if (opened) {
-            ctx.tabIds.set(savedTab.id, opened.tabId);
-            claimedTabs.add(opened.tabId);
-          }
-          if (ctx.panes > beforePanes) changed = true;
-        }
-        space = spaces().find((s) => s.id === out.space) ?? null;
-      } else {
-        claimed.add(space.id);
-        ctx.spaceIds.set(savedSpace.id, space.id);
-        const claimedTabs = new Set();
-        for (const savedTab of savedSpace.tabs) {
-          const beforeTabs = new Set((space.tabs ?? []).map((t) => t.id));
-          const beforePanes = ctx.panes;
-          const opened = await restoreTabPanes(space, savedTab, settings, ctx, claimedTabs);
-          if (opened) {
-            ctx.tabIds.set(savedTab.id, opened.tabId);
-            if (!beforeTabs.has(opened.tabId)) changed = true;
-          }
-          if (ctx.panes > beforePanes) changed = true;
-        }
+      ctx.machine = savedSpace.machine ?? null;
+      ctx.shell = await shellForMachine(snapshot, ctx.machine, ctx.shells);
+      ctx.spaceName = savedSpace.name;
+      try {
+        if (await restoreSpace(savedSpace, settings, ctx, claimed, auto)) changed = true;
+      } catch (error) {
+        noteError(ctx, null, error);
       }
     }
 
@@ -674,10 +778,13 @@ export async function restoreSession({ cx, auto = false } = {}) {
     }
 
     const count = ctx.panes;
-    const errorText = ctx.errors.length ? `; ${ctx.errors[0]}` : "";
+    const firstError = ctx.errors[0]?.replace(/^cannot start a terminal: /, "") ?? "";
+    const errorText = ctx.errors.length
+      ? ` · ${ctx.errors.length} ${ctx.errors.length === 1 ? "program" : "programs"} failed${firstError ? `: ${firstError}${ctx.errors.length > 1 ? ` (+${ctx.errors.length - 1} more)` : ""}` : ""}`
+      : "";
     if (changed || !auto || ctx.errors.length) {
       notify({
-        title: ctx.errors.length ? "Sessions partly restored" : changed ? "Sessions restored" : "Sessions already open",
+        title: ctx.errors.length ? (changed ? "Sessions partly restored" : "Couldn't restore sessions") : changed ? "Sessions restored" : "Sessions already open",
         body: `${ctx.spaces} new ${ctx.spaces === 1 ? "space" : "spaces"} · ${count} ${count === 1 ? "program" : "programs"} started${ctx.skipped ? ` · ${ctx.skipped} already running` : ""}${errorText}`,
         level: ctx.errors.length ? "warning" : "success",
       });

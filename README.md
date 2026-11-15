@@ -116,9 +116,14 @@ Restoring:
 - matches spaces and tabs by their Herdr ids first, then by name/folder;
 - leaves already-running terminals alone;
 - starts programs in their saved folder;
+- starts programs on another machine through that machine's shell, so they get
+  the PATH and environment a person gets when typing the command (for example
+  `opencode` installed under `~/.opencode/bin`, outside `herdr-core`'s SSH PATH);
 - restores extra panes as splits to the right;
 - restores settled tabs and zoomed panes where possible;
-- selects the saved active space and tab at the end.
+- selects the saved active space and tab at the end;
+- keeps going when a space, tab or pane cannot be restored, and reports what
+  failed instead of stopping at the first error.
 
 A recovered shell from herdr-core (for example after a reboot) is left in
 place; the missing program is added beside it instead of killing the shell.
